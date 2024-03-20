@@ -1,0 +1,6 @@
+*.onnx
+*.mnn
+*.txt
+
+*-onnx
+*.bin

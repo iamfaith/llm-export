@@ -1200,7 +1200,7 @@ if __name__ == '__main__':
         'lora': LoraModule
     }
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
+    parser.add_argument('--path', type=str, default='/home/faith/.cache/huggingface/hub/models--Qwen--Qwen1.5-0.5B-Chat/snapshots/6c705984bb8b5591dd4e1a9e66e1a127965fd08d', required=True,
                         help='path(`str` or `os.PathLike`):\nCan be either:'
                         '\n\t- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]'
                         '\n\t- A path to a *directory* clone from repo like `../chatglm-6b`.')
@@ -1211,11 +1211,11 @@ if __name__ == '__main__':
     parser.add_argument('--onnx_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
     parser.add_argument('--mnn_path', type=str, default='./mnn', help='export mnn model path, defaut is `./mnn`.')
     parser.add_argument('--export_mnn', action='store_true', default=False, help='Whether or not to export mnn model after onnx.')
-    parser.add_argument('--export_verbose', action='store_true', default=False, help='Whether or not to export onnx with verbose.')
+    parser.add_argument('--export_verbose', action='store_true', default=True, help='Whether or not to export onnx with verbose.')
     parser.add_argument('--export_test', action='store_true', help='Whether or not to export onnx with test using onnxruntime.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', action='store_true', help='export model to an `onnx` model.')
-    parser.add_argument('--export_split', action='store_true',
+    parser.add_argument('--export_split', action='store_true', default=False,
                         help='export model split to some `onnx` models:'
                         '\n\t- embedding model.'
                         '\n\t- block models.'
