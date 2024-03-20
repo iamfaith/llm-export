@@ -35,6 +35,18 @@ def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data
 onnx_model = "/home/faith/llm-export/Qwen1.5-0.5B-Chat-onnx-old"
 mnn_path = "/home/faith/llm-export/Qwen1.5-0.5B-Chat-mnn"
 from glob import glob
-for f in glob(f"{onnx_model}/*.onnx"):
+
+def convertmnn():
+    for f in glob(f"{onnx_model}/*.onnx"):
+        onnx2mnn(f, mnn_path, asymmetric=False)
     
-    onnx2mnn(f, mnn_path, asymmetric=False)
+    
+    
+import onnx
+from onnxconverter_common import float16
+
+for f in glob(f"{onnx_model}/*.onnx"):
+    model = onnx.load(f)
+    
+    model_fp16 = float16.convert_float_to_float16(model)
+    onnx.save(model_fp16, f"/home/faith/llm-export/Qwen1.5-0.5B-Chat-onnx-fp16/{os.path.basename(f)}")
