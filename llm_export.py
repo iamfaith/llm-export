@@ -9,6 +9,7 @@ from onnxslim import slim
 import onnxruntime as ort
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 try:
     import _tools as MNNTools
 except:
@@ -109,9 +110,19 @@ class LLM(torch.nn.Module):
         self.max_length = 1024
         self.hidden_size = 4096
         self.visual = None # defualt is not visual
-        self.load_model(args.path)
+        self.lora_path = args.lora_path
+        self.load_hf(args.path)
+        self.load_model()
 
-    def load_model(self, model_path: str):
+    def load_hf(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        self.config = self.model.config
+        if self.lora_path is not None:
+            adapter = PeftModel.from_pretrained(self.model, model_id=self.lora_path)
+            self.model = adapter.merge_and_unload(progressbar=True)
+
+    def load_model(self):
         raise NotImplementedError
 
     def get_attention_mask(self) -> torch.Tensor:
@@ -487,11 +498,9 @@ class Chatglm_6b(LLM):
         super().__init__(args)
         self.model_name = 'Chatglm_6b'
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        transformer = model.transformer
-        self.lm_ = model.lm_head
+    def load_model(self):
+        transformer = self.model.transformer
+        self.lm_ = self.model.lm_head
         self.embed_ = transformer.word_embeddings
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.final_layernorm
@@ -572,10 +581,8 @@ class Chatglm2_6b(LLM):
         if 'codegeex2-6b' in args.path:
             self.model_name = 'Codegeex2_6b'
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        transformer = model.transformer
+    def load_model(self):
+        transformer = self.model.transformer
         self.lm_ = transformer.output_layer
         self.embed_ = transformer.embedding.word_embeddings
         self.blocks_ = transformer.encoder.layers
@@ -686,17 +693,15 @@ class Qwen_Chat(LLM):
     def __init__(self, args):
         super().__init__(args)
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+    def load_model(self):
         # Qwen models
         self.model_name = 'Qwen-7B'
         if '1_8' in model_path:
             self.model_name = 'Qwen-1_8b'
         if 'VL' in model_path:
             self.model_name = 'Qwen-VL'
-        transformer = model.transformer
-        self.lm_ = model.lm_head
+        transformer = self.model.transformer
+        self.lm_ = self.model.lm_head
         self.embed_ = transformer.wte
         self.blocks_ = transformer.h
         self.final_layernorm_ = transformer.ln_f
@@ -766,21 +771,22 @@ class Qwen_Chat(LLM):
         return hidden_states.view(-1, 1, self.hidden_size)
 
 class QWEN2Block(torch.nn.Module):
-    def __init__(self, name, block, block_id, hidden_size, head_dim, final_layernorm = None):
+    def __init__(self, name, block, block_id, config, final_layernorm = None):
         super().__init__()
         self.name = name
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
-        self.hidden_size = hidden_size
-        self.head_dim = head_dim
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.rope_theta = config.rope_theta
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        theta = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
-        rotary_pos_emb = rotary_pos_emb.unsqueeze(0).unsqueeze(0)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
         rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
         hidden_states, presents = self.block(hidden_states=hidden_states,
@@ -800,43 +806,46 @@ class Qwen2_Chat(LLM):
     def __init__(self, args):
         super().__init__(args)
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        self.config = model.config
+    def load_model(self):
         # Qwen2 models
         self.model_name = 'Qwen2'
-        transformer = model.model
-        self.lm_ = model.lm_head
+        transformer = self.model.model
+        self.lm_ = self.model.lm_head
         self.embed_ = transformer.embed_tokens
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.stop_id = self.tokenizer.eos_token_id
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
-            for id in model.generation_config.eos_token_id:
+            for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
         self.block_nums = self.config.num_hidden_layers
         self.hidden_size = self.config.hidden_size
         self.num_heads = self.config.num_attention_heads
+        self.rope_theta = self.config.rope_theta
         self.head_dim = self.hidden_size // self.num_heads
-        self.embed = Embedding(self.embed_, self.embed_bf16)
+        if self.embed_.weight is self.lm_.weight:
+            import copy
+            embed_copy = copy.deepcopy(self.embed_)
+            self.embed = Embedding(embed_copy, self.embed_bf16)
+        else:
+            self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, 0, self.head_dim]
-        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.past_kv_shape = [self.block_nums, 2, 1, 0, self.num_heads, self.head_dim]
+        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.config, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 0: "seq_len" },
-            "past_key_values" : { 2: "history_len" }
+            "past_key_values" : { 1: "history_len" }
         }
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 0: "seq_len" },
-            "past_key_values" : { 3: "history_len" }
+            "past_key_values" : { 2: "history_len" }
         }
 
     def build_prompt(self, query):
@@ -906,42 +915,45 @@ class Llama2_7b_Chat(LLM):
             self.model_name = 'Yi'
         if 'deepseek' in args.path:
             self.model_name = 'deepseek'
+        if 'Llama-3' in args.path:
+            self.model_name = 'Llama3_8B'
         super().__init__(args)
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        transformer = model.model
-        self.lm_ = model.lm_head
+    def load_model(self):
+        self.config = self.model.config
+        transformer = self.model.model
+        self.lm_ = self.model.lm_head
         self.embed_ = transformer.embed_tokens
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.hidden_size = self.embed_.weight.shape[-1]
         self.stop_id = self.tokenizer.eos_token_id
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
-            self.stop_ids.append(model.generation_config.eos_token_id)
+            self.stop_ids.append(self.model.generation_config.eos_token_id)
+        if self.model_name == 'Llama3_8B':
+            self.stop_ids.append(self.tokenizer.convert_tokens_to_ids("<|eot_id|>"))
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
-        # some config for export
-        self.past_kv_shape = [32, 2, 1, 32, 0, 128]
-        if 'Yi' in self.model_name:
-            self.past_kv_shape = [32, 2, 1, 4, 0, 128]
-        if self.block_nums == 22:
-            self.past_kv_shape = [22, 2, 1, 4, 0, 64]
+        self.block_nums = self.config.num_hidden_layers
+        self.hidden_size = self.config.hidden_size
+        self.num_attention_heads = self.config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
+        self.past_kv_shape = [self.block_nums, 2, 1, self.num_key_value_heads, 0, self.head_dim]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
-            "position_ids" : { 0: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
             "past_key_values" : { 3: "history_len" }
         }
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
-            "position_ids" : { 0: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
             "past_key_values" : { 4: "history_len" }
         }
 
@@ -956,8 +968,9 @@ class Llama2_7b_Chat(LLM):
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
         if 'deepseek' in self.model_name:
             return f'<|begin▁of▁sentence|>User: {query}\nAssistant:'
+        if 'Llama3' in self.model_name:
+            return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
         return f'[INST]{query}[/INST]'
-
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -998,11 +1011,9 @@ class phi_2(LLM):
         self.model_name = 'phi-2'
         self.asymmetric = False # TODO: some precision bug when using asymmetric
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        transformer = model.transformer
-        self.lm_ = model.lm_head
+    def load_model(self):
+        transformer = self.model.transformer
+        self.lm_ = self.model.lm_head
         self.embed_ = transformer.embd.wte
         self.hidden_size = self.embed_.weight.shape[-1]
         self.blocks_ = transformer.h
@@ -1080,12 +1091,10 @@ class bge(LLM):
         res = self.forward(input_ids, position_ids, attention_mask)
         return res
 
-    def load_model(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        transformer = model.encoder
-        self.lm_ = model.pooler
-        self.embed_ = model.embeddings
+    def load_model(self):
+        transformer = self.model.encoder
+        self.lm_ = self.model.pooler
+        self.embed_ = self.model.embeddings
         self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
         self.blocks_ = transformer.layer
         # some wrapper
@@ -1184,6 +1193,7 @@ if __name__ == '__main__':
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_Chat,
         'Qwen-1_8B-Chat': Qwen_Chat,
+        'Qwen-1_8B': Qwen_Chat,
         'Qwen-VL-Chat': Qwen_Chat,
         'Qwen1_5-0_5B-Chat': Qwen2_Chat,
         'Qwen1_5-1_8B-Chat': Qwen2_Chat,
@@ -1191,6 +1201,7 @@ if __name__ == '__main__':
         'Qwen1_5-7B-Chat': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'Llama-3-8B-Instruct': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,
         'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
         'Yi-6B-Chat': Llama2_7b_Chat,
@@ -1208,6 +1219,7 @@ if __name__ == '__main__':
                         help='type(`str`, *optional*):'
                         '\n\tThe pretrain llm model type.'
                         )
+    parser.add_argument('--lora_path', type=str, default=None, help='lora path, defaut is `None` mean not apply lora.')
     parser.add_argument('--onnx_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
     parser.add_argument('--mnn_path', type=str, default='./mnn', help='export mnn model path, defaut is `./mnn`.')
     parser.add_argument('--export_mnn', action='store_true', default=False, help='Whether or not to export mnn model after onnx.')
